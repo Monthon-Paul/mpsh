@@ -61,7 +61,7 @@ void sh_loop() {
     history = jobs = 0;
 
     do {
-        printf("utsh$ ");
+        printf("mpsh$ ");
         line = sh_read_line();
         if (strcmp(line, "\n"))
             cmds[history++] = strdup(line);
@@ -196,7 +196,7 @@ int sh_history(char **cmds) {
 int sh_cd(char **args) {
     if (args[1]) {
         if (chdir(args[1]) == -1)
-            perror("utsh");
+            perror("mpsh");
     } else {
         printf("expected argument for cd\n");
     }
@@ -238,7 +238,7 @@ void sh_redirect(int pos) {
     if (input) {
         int in = open(input, O_RDONLY);
         if (in == -1) {
-            perror("utsh");
+            perror("mpsh");
             exit(EXIT_FAILURE);
         }
         dup2(in, STDIN_FILENO);
@@ -247,7 +247,7 @@ void sh_redirect(int pos) {
     if (output) {
         int out = creat(output, 0644);
         if (out == -1) {
-            perror("utsh");
+            perror("mpsh");
             exit(EXIT_FAILURE);
         }
         dup2(out, STDOUT_FILENO);
