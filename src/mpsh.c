@@ -1,6 +1,6 @@
 /*
  * mpsh - My own Simple Shell program
- * has the following to exec programs, 
+ * has the following to exec programs,
  * I/O redirect, Piping & many more
  *
  * @author Monthon Paul
@@ -14,9 +14,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define SH_TOK_BUFSIZE 32
-#define SH_HISTORY_CMD 200
-#define SH_TOK_DELIM " \t\r\n\a"
+#define MPSH_TOK_BUFSIZE 32
+#define MPSH_HISTORY_CMD 200
+#define MPSH_TOK_DELIM " \t\r\n\a"
 
 /* I/O redirections */
 typedef struct IO {
@@ -27,16 +27,28 @@ typedef struct IO {
 static IO files;
 static unsigned short piping, bg, jobs, history;
 
+/* List of builtin commands */
+static char *builtin_str[] = {"cd", "help", "history", "quit"};
+
 /* forward declarations */
-char ***sh_split_line(char *line);
-int sh_execute(char ***args, char **cmds);
-int sh_launch(char ***args, char **cmds);
-int sh_piping(char ***args);
-int sh_history(char **cmds);
-void sh_redirect(int pos);
-int sh_cd(char **args);
-char *sh_read_line();
-void sh_loop();
+char ***mpsh_split_line(char *line);
+int mpsh_execute(char ***args, char **cmds);
+int mpsh_launch(char ***args, char **cmds);
+int mpsh_piping(char ***args);
+int mpsh_history(char **cmds);
+void mpsh_redirect(int pos);
+int mpsh_cd(char **args);
+int mpsh_help(char **args);
+int mpsh_exit(char **args);
+char *mpsh_read_line();
+int mpsh_size_builtins();
+void mpsh_loop();
+
+int (*builtin_func[])(char **) = {
+    &mpsh_cd,
+    &mpsh_help,
+    &mpsh_history,
+    &mpsh_exit};
 
 /**
  * @brief Main entry point.
@@ -46,29 +58,29 @@ void sh_loop();
  */
 int main(int argc, char **argv) {
     // Run command loop.
-    sh_loop();
+    mpsh_loop();
     return 0;
 }
 
 /**
  * @brief Loop getting input and executing it.
  */
-void sh_loop() {
+void mpsh_loop() {
     char *line;
     char ***args;
     int status;
-    char *cmds[SH_HISTORY_CMD] = {NULL};
+    char *cmds[MPSH_HISTORY_CMD] = {NULL};
     history = jobs = 0;
 
     do {
         printf("mpsh$ ");
-        line = sh_read_line();
+        line = mpsh_read_line();
         if (strcmp(line, "\n"))
             cmds[history++] = strdup(line);
-        args = sh_split_line(line);
-        status = sh_execute(args, cmds);
+        args = mpsh_split_line(line);
+        status = mpsh_execute(args, cmds);
 
-        for (int i = 0; i < SH_TOK_BUFSIZE; i++)
+        for (int i = 0; i < MPSH_TOK_BUFSIZE; i++)
             free(args[i]);
         free(files.input);
         free(files.output);
@@ -81,7 +93,7 @@ void sh_loop() {
  * @brief Read a line of input from stdin.
  * @return The line from stdin.
  */
-char *sh_read_line() {
+char *mpsh_read_line() {
     char *line = NULL;
     size_t bufsize = 0;  // have getline allocate a buffer for us
 
@@ -89,7 +101,7 @@ char *sh_read_line() {
         if (feof(stdin)) {
             exit(EXIT_SUCCESS);  // We recieved an EOF
         } else {
-            perror("sh: readline");
+            perror("mpsh: readline");
             exit(EXIT_FAILURE);
         }
     }
@@ -100,8 +112,8 @@ char *sh_read_line() {
  * @param line The line.
  * @return Null-terminated array of tokens.
  */
-char ***sh_split_line(char *line) {
-    int bufsize = SH_TOK_BUFSIZE, pos = 0, cmdpos = 0;
+char ***mpsh_split_line(char *line) {
+    int bufsize = MPSH_TOK_BUFSIZE, pos = 0, cmdpos = 0;
     char ***tokens = calloc(bufsize, sizeof(char *));
     files.input = calloc(bufsize, sizeof(char *));
     files.output = calloc(bufsize, sizeof(char *));
@@ -111,27 +123,27 @@ char ***sh_split_line(char *line) {
     piping = bg = 0;
 
     if (!tokens) {
-        fprintf(stderr, "sh: allocation error\n");
+        fprintf(stderr, "mpsh: allocation error\n");
         exit(EXIT_FAILURE);
     }
 
-    token = strtok(line, SH_TOK_DELIM);
+    token = strtok(line, MPSH_TOK_DELIM);
     while (token != NULL) {
         if (!strcmp(token, "<")) {
-            token = strtok(NULL, SH_TOK_DELIM);
+            token = strtok(NULL, MPSH_TOK_DELIM);
             files.input[cmdpos] = token;
         } else if (!strcmp(token, ">")) {
-            token = strtok(NULL, SH_TOK_DELIM);
+            token = strtok(NULL, MPSH_TOK_DELIM);
             files.output[cmdpos] = token;
         } else if (!strcmp(token, "|")) {
             tokens[cmdpos][pos] = NULL;
             pos = 0, piping = 1;
-            token = strtok(NULL, SH_TOK_DELIM);
+            token = strtok(NULL, MPSH_TOK_DELIM);
             tokens[++cmdpos][pos++] = token;
         } else if (!strcmp(token, ";")) {
             tokens[cmdpos][pos] = NULL;
             pos = 0;
-            token = strtok(NULL, SH_TOK_DELIM);
+            token = strtok(NULL, MPSH_TOK_DELIM);
             tokens[++cmdpos][pos++] = token;
         } else if (!strcmp(token, "&")) {
             bg = 1;
@@ -140,20 +152,26 @@ char ***sh_split_line(char *line) {
         }
 
         if (pos >= bufsize) {
-            bufsize += SH_TOK_BUFSIZE;
+            bufsize += MPSH_TOK_BUFSIZE;
             tokens_backup = tokens[cmdpos];
             tokens[cmdpos] = realloc(tokens, bufsize * sizeof(char *));
             if (!tokens) {
                 free(tokens_backup);
-                fprintf(stderr, "sh: allocation error\n");
+                fprintf(stderr, "mpsh: allocation error\n");
                 exit(EXIT_FAILURE);
             }
         }
 
-        token = strtok(NULL, SH_TOK_DELIM);
+        token = strtok(NULL, MPSH_TOK_DELIM);
     }
     tokens[cmdpos][pos] = NULL;
     return tokens;
+}
+/**
+ * Get the size of builtin commands
+ */
+int mpsh_size_builtins() {
+    return sizeof(builtin_str) / sizeof(char *);
 }
 
 /**
@@ -161,19 +179,44 @@ char ***sh_split_line(char *line) {
  *  @param args Null terminated list of arguments.
  *  @return 1 if the shell should continue running, 0 if it should terminate
  */
-int sh_execute(char ***args, char **cmds) {
+int mpsh_execute(char ***args, char **cmds) {
     if (**args == NULL)
         return 1;  // An empty command was entered.
     if (*args[1] && piping)
-        return sh_piping(args);
-    if (!strcmp(**args, "history"))
-        return sh_history(cmds);
-    if (!strcmp(**args, "cd"))
-        return sh_cd(*args);
-    if (!strcmp(**args, "quit"))
-        exit(EXIT_SUCCESS);
+        return mpsh_piping(args);
+    for (int i = 0; i < mpsh_size_builtins(); i++) {
+        if(!strcmp(**args, "history") && !strcmp(**args, builtin_str[i]))
+            return (*builtin_func[i])(cmds);
+        else if (!strcmp(**args, builtin_str[i]))
+            return (*builtin_func[i])(*args);
+    }
 
-    return sh_launch(args, cmds);  // launch
+    return mpsh_launch(args, cmds);  // launch
+}
+
+/**
+ * Help information about the Shell program
+ * @param args list of arguments (including program).
+ * @return 1 if the shell should continue running, 0 if it should terminate
+ */
+int mpsh_help(char **args) {
+    printf("Monthon Paul MPSH\n");
+    printf("Type program names and arguments, and hit enter.\n");
+    printf("The following are built in:\n");
+
+    for (int i = 0; i < mpsh_size_builtins(); i++)
+        printf("  %s\n", builtin_str[i]);
+
+    printf("Use the man command for information on other programs.\n");
+    return 1;
+}
+
+/**
+ * quit out of the Shell program
+ * @param args list of arguments (including program).
+ */
+int mpsh_exit(char **args) {
+    exit(EXIT_SUCCESS);
 }
 
 /**
@@ -181,9 +224,8 @@ int sh_execute(char ***args, char **cmds) {
  * @param cmds list of commands enter
  * @return Always returns 1, to continue execution.
  */
-int sh_history(char **cmds) {
-    int i;
-    for (i = 0; cmds[i] != NULL; i++)
+int mpsh_history(char **cmds) {
+    for (int i = 0; cmds[i] != NULL; i++)
         printf("%d %s", i + 1, cmds[i]);
     return 1;
 }
@@ -193,7 +235,7 @@ int sh_history(char **cmds) {
  * @param args list of arguments (including program).
  * @return Always returns 1, to continue execution.
  */
-int sh_cd(char **args) {
+int mpsh_cd(char **args) {
     if (args[1]) {
         if (chdir(args[1]) == -1)
             perror("mpsh");
@@ -208,13 +250,13 @@ int sh_cd(char **args) {
  * @param args Null terminated list of arguments (including program).
  * @return Always returns 1, to continue execution.
  */
-int sh_launch(char ***args, char **cmds) {
+int mpsh_launch(char ***args, char **cmds) {
     pid_t pid;
     int status;
     /* loop through listing */
     for (int i = 0; *args[i] != NULL; i++) {
         if ((pid = fork()) == 0) {
-            sh_redirect(i);
+            mpsh_redirect(i);
             if (execvp(*args[i], args[i]) == -1) {
                 printf("%s: Command not found\n", *args[i]);
                 exit(EXIT_FAILURE);
@@ -233,7 +275,7 @@ int sh_launch(char ***args, char **cmds) {
  * @brief I/O redirect to a file
  * @param pos I/O position for input file or output file
  */
-void sh_redirect(int pos) {
+void mpsh_redirect(int pos) {
     char *input = files.input[pos], *output = files.output[pos];
     if (input) {
         int in = open(input, O_RDONLY);
@@ -260,7 +302,7 @@ void sh_redirect(int pos) {
  * @param args 2D array of strings terminated by NULL
  * @return Always returns 1, to continue execution.
  */
-int sh_piping(char ***args) {
+int mpsh_piping(char ***args) {
     pid_t pid;
     int fds[2], size, next_input;
     for (size = 0; *args[size] != NULL; size++) {
@@ -275,7 +317,7 @@ int sh_piping(char ***args) {
         close(fds[1]);
 
         // check for I/O redirects
-        sh_redirect(0);
+        mpsh_redirect(0);
         if (execvp(**args, *args) == -1) {
             printf("%s: Command not found\n", **args);
             exit(1);
@@ -292,7 +334,7 @@ int sh_piping(char ***args) {
             close(fds[0]);
 
             // check for I/O redirects
-            sh_redirect(i);
+            mpsh_redirect(i);
             if (execvp(*args[i], args[i]) == -1) {
                 printf("%s: Command not found\n", *args[i]);
                 exit(1);
@@ -307,7 +349,7 @@ int sh_piping(char ***args) {
         dup2(next_input, STDIN_FILENO);
 
         // check for I/O redirects
-        sh_redirect(size - 1);
+        mpsh_redirect(size - 1);
         if (execvp(*args[size - 1], args[size - 1]) == -1) {
             printf("%s: Command not found\n", *args[size - 1]);
             exit(1);
