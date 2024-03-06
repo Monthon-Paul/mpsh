@@ -1,16 +1,16 @@
 # MPSH
 Authors: Monthon Paul
 
-Last Updated: 2/4/2024
+Last Updated: 3/6/2024
 
 ## Purpose
 
 MPSH is a simple implementation of a shell in C, 
 It demonstrates the basics of how a shell works. 
-Many features can exec program, piping, redirection, listing, run backgrounds
-Other features I plan to implemnent are Crt-C, Crt-Z, foreground, background, and jobs later
+Many features can exec program, piping, redirection, listing, run backgrounds, list of jobs, etc.
+Other features I plan to implemnent are Ctrl-C, Ctrl-Z, foreground, and background later
 
-* Only builtins are: `cd`, `exit`.
+* builtins commands: `help`, `quit`, `cd`, `hisotry`, `jobs`.
 
 ## Running
 
