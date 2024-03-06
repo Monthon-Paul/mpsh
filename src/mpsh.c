@@ -6,7 +6,9 @@
  * @author Monthon Paul
  * @version February 4, 2024
  */
+#include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +19,23 @@
 #define MPSH_TOK_BUFSIZE 32
 #define MPSH_HISTORY_CMD 200
 #define MPSH_TOK_DELIM " \t\r\n\a"
+#define MPSH_MAXJOBS 16
+#define MPSH_MAXJID 1 << 16 /* max job ID */
+
+/* Job states */
+#define UNDEF 0 /* undefined */
+#define FG 1    /* running in foreground */
+#define BG 2    /* running in background */
+#define ST 3    /* stopped */
+
+typedef struct job_t {              /* The job struct */
+    pid_t pid;                      /* job PID */
+    int jid;                        /* job ID [1, 2, ...] */
+    int state;                      /* UNDEF, BG, FG, or ST */
+    char cmdline[MPSH_TOK_BUFSIZE]; /* command line */
+} job_t;
+
+job_t jobs[MPSH_MAXJOBS]; /* The job list */
 
 /* I/O redirections */
 typedef struct IO {
@@ -24,31 +43,58 @@ typedef struct IO {
     char **output;
 } IO;
 
+/* Global variables */
 static IO files;
-static unsigned short piping, bg, jobs, history;
+static unsigned short piping, history;
+static int *bg;
+static char concat[MPSH_TOK_BUFSIZE];
+int nextjid = 1; /* next job ID to allocate */
 
 /* List of builtin commands */
-static char *builtin_str[] = {"cd", "help", "history", "quit"};
+static char *builtin_str[] = {"help", "quit", "cd", "history", "jobs", "fg", "bg"};
 
 /* forward declarations */
 char ***mpsh_split_line(char *line);
 int mpsh_execute(char ***args, char **cmds);
-int mpsh_launch(char ***args, char **cmds);
+int mpsh_launch(char ***args, sigset_t sigs);
 int mpsh_piping(char ***args);
 int mpsh_history(char **cmds);
-void mpsh_redirect(int pos);
 int mpsh_cd(char **args);
 int mpsh_help(char **args);
 int mpsh_exit(char **args);
+void mpsh_redirect(int pos);
+void mpsh_bg(int jid);
+void mpsh_fg(int jid);
+void waitfg(pid_t pid);
+char *concatstr(char **str, int bg);
 char *mpsh_read_line();
 int mpsh_size_builtins();
 void mpsh_loop();
 
+void sigchld_handler(int sig);
+// void sigtstp_handler(int sig);
+// void sigint_handler(int sig);
+// void sigquit_handler(int sig);
+
+void clearjob(job_t *job);
+void initjobs(job_t *jobs);
+int maxjid(job_t *jobs);
+int addjob(job_t *jobs, pid_t pid, int state, char *cmdline);
+int deletejob(job_t *jobs, pid_t pid);
+job_t *getjobpid(job_t *jobs, pid_t pid);
+job_t *getjobjid(job_t *jobs, int jid);
+int pid2jid(pid_t pid);
+int listjobs(job_t *jobs);
+
+void unix_error(char *msg);
+typedef void handler_t(int);
+handler_t *Signal(int signum, handler_t *handler);
+
 int (*builtin_func[])(char **) = {
-    &mpsh_cd,
     &mpsh_help,
-    &mpsh_history,
-    &mpsh_exit};
+    &mpsh_exit,
+    &mpsh_cd,
+    &mpsh_history};
 
 /**
  * @brief Main entry point.
@@ -57,6 +103,18 @@ int (*builtin_func[])(char **) = {
  * @return status code
  */
 int main(int argc, char **argv) {
+    /* Install the signal handlers */
+
+    // Signal(SIGINT, sigint_handler);   /* ctrl-c */
+    // Signal(SIGTSTP, sigtstp_handler); /* ctrl-z */
+    Signal(SIGCHLD, sigchld_handler); /* Terminated or stopped child */
+
+    /* This one provides a clean way to kill the shell */
+    // Signal(SIGQUIT, sigquit_handler);
+
+    /* Initialize the job list */
+    initjobs(jobs);
+
     // Run command loop.
     mpsh_loop();
     return 0;
@@ -70,7 +128,7 @@ void mpsh_loop() {
     char ***args;
     int status;
     char *cmds[MPSH_HISTORY_CMD] = {NULL};
-    history = jobs = 0;
+    history = 0;
 
     do {
         printf("mpsh$ ");
@@ -86,6 +144,7 @@ void mpsh_loop() {
         free(files.output);
         free(line);
         free(args);
+        free(bg);
     } while (status);
 }
 
@@ -117,10 +176,11 @@ char ***mpsh_split_line(char *line) {
     char ***tokens = calloc(bufsize, sizeof(char *));
     files.input = calloc(bufsize, sizeof(char *));
     files.output = calloc(bufsize, sizeof(char *));
+    bg = malloc(bufsize * sizeof(int));
     for (int i = 0; i < bufsize; i++)
         tokens[i] = calloc(bufsize, sizeof(char *));
     char *token, **tokens_backup;
-    piping = bg = 0;
+    piping = 0;
 
     if (!tokens) {
         fprintf(stderr, "mpsh: allocation error\n");
@@ -146,7 +206,7 @@ char ***mpsh_split_line(char *line) {
             token = strtok(NULL, MPSH_TOK_DELIM);
             tokens[++cmdpos][pos++] = token;
         } else if (!strcmp(token, "&")) {
-            bg = 1;
+            bg[cmdpos] = 1;
         } else {
             tokens[cmdpos][pos++] = token;
         }
@@ -182,16 +242,26 @@ int mpsh_size_builtins() {
 int mpsh_execute(char ***args, char **cmds) {
     if (**args == NULL)
         return 1;  // An empty command was entered.
+
+    // Signal Bockers
+    sigset_t sigs;
+    sigemptyset(&sigs);
+    sigaddset(&sigs, SIGCHLD);
+    sigaddset(&sigs, SIGSTOP);
+    sigaddset(&sigs, SIGINT);
+
     if (*args[1] && piping)
         return mpsh_piping(args);
     for (int i = 0; i < mpsh_size_builtins(); i++) {
-        if(!strcmp(**args, "history") && !strcmp(**args, builtin_str[i]))
+        if (!strcmp(**args, "jobs"))
+            return listjobs(jobs);
+        else if (!strcmp(**args, "history") && !strcmp(**args, builtin_str[i]))
             return (*builtin_func[i])(cmds);
         else if (!strcmp(**args, builtin_str[i]))
             return (*builtin_func[i])(*args);
     }
 
-    return mpsh_launch(args, cmds);  // launch
+    return mpsh_launch(args, sigs);  // launch
 }
 
 /**
@@ -250,25 +320,63 @@ int mpsh_cd(char **args) {
  * @param args Null terminated list of arguments (including program).
  * @return Always returns 1, to continue execution.
  */
-int mpsh_launch(char ***args, char **cmds) {
+int mpsh_launch(char ***args, sigset_t sigs) {
     pid_t pid;
-    int status;
+
     /* loop through listing */
     for (int i = 0; *args[i] != NULL; i++) {
+        sigprocmask(SIG_BLOCK, &sigs, NULL);
         if ((pid = fork()) == 0) {
+            // Set process group ID
+            setpgid(0, 0);
+
+            // need to unblock before exec call
+            sigprocmask(SIG_UNBLOCK, &sigs, NULL);
             mpsh_redirect(i);
             if (execvp(*args[i], args[i]) == -1) {
                 printf("%s: Command not found\n", *args[i]);
                 exit(EXIT_FAILURE);
             }
         }
+        addjob(jobs, pid, (bg[i]) ? BG : FG, concatstr(args[i], bg[i]));
+        sigprocmask(SIG_UNBLOCK, &sigs, NULL);
         /* Parent waits for child to terminate, unless it's background */
-        if (!bg)
-            waitpid(pid, &status, 0);
+        if (!bg[i])
+            waitfg(pid);
         else
-            printf("[%d] (%d) %s", ++jobs, pid, cmds[history - 1]);
+            printf("[%d] (%d) %s", pid2jid(pid), pid, concatstr(args[i], bg[i]));
     }
     return 1;
+}
+
+/**
+ *
+ *
+ */
+char *concatstr(char **str, int bg) {
+    *concat = '\0';
+    for (int i = 0; str[i] != NULL; i++) {
+        strcat(concat, str[i]);
+        if (str[i + 1] != NULL)
+            strcat(concat, " ");
+    }
+    if (bg)
+        strcat(concat, " &");
+    return strcat(concat, "\n");  // add newline at end
+}
+
+/*
+ * waitfg - Block until process pid is no longer the foreground process
+ */
+void waitfg(pid_t pid) {
+    job_t *fg_job = getjobpid(jobs, pid);
+    // loop around sigsupend so the shell is blocked until fg is not null and still in FG state.
+    while (fg_job != NULL && fg_job->state == FG) {
+        // block signal for a bit and unblock
+        sigset_t empty;
+        sigemptyset(&empty);
+        sigsuspend(&empty);
+    }
 }
 
 /**
@@ -361,4 +469,176 @@ int mpsh_piping(char ***args) {
     for (int i = 0; i < size - 1; i++)
         waitpid(pid, &status, 0);
     return 1;
+}
+
+/*****************
+ * Signal handlers
+ *****************/
+
+/*
+ * sigchld_handler - The kernel sends a SIGCHLD to the shell whenever
+ *     a child job terminates (becomes a zombie), or stops because it
+ *     received a SIGSTOP or SIGTSTP signal. The handler reaps all
+ *     available zombie children, but doesn't wait for any other
+ *     currently running children to terminate.
+ */
+void sigchld_handler(int sig) {
+    int status;
+    pid_t pid;
+    // Must reap potentially multiple children because signals are not queued.
+    // Use WNOHANG or WUNTRACED so we can stop this loop as soon as no zombies are available.
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        if (WIFSIGNALED(status)) {
+            printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, SIGINT);
+            deletejob(jobs, pid);
+        } else if (WIFSTOPPED(status)) {
+            printf("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, SIGTSTP);
+            getjobpid(jobs, pid)->state = ST;
+        } else if (WIFEXITED(status))
+            deletejob(jobs, pid);
+    }
+}
+
+/***********************************************
+ * Helper routines that manipulate the job list
+ **********************************************/
+
+/* clearjob - Clear the entries in a job struct */
+void clearjob(job_t *job) {
+    job->pid = 0;
+    job->jid = 0;
+    job->state = UNDEF;
+    job->cmdline[0] = '\0';
+}
+
+/* initjobs - Initialize the job list */
+void initjobs(job_t *jobs) {
+    for (int i = 0; i < MPSH_MAXJOBS; i++)
+        clearjob(&jobs[i]);
+}
+
+/* maxjid - Returns largest allocated job ID */
+int maxjid(job_t *jobs) {
+    int max = 0;
+    for (int i = 0; i < MPSH_MAXJOBS; i++)
+        if (jobs[i].jid > max)
+            max = jobs[i].jid;
+    return max;
+}
+
+/* addjob - Add a job to the job list */
+int addjob(job_t *jobs, pid_t pid, int state, char *cmdline) {
+    if (pid < 1)
+        return 0;
+    for (int i = 0; i < MPSH_MAXJOBS; i++) {
+        if (jobs[i].pid == 0) {
+            jobs[i].pid = pid;
+            jobs[i].state = state;
+            jobs[i].jid = nextjid++;
+            if (nextjid > MPSH_MAXJOBS)
+                nextjid = 1;
+            strcpy(jobs[i].cmdline, cmdline);
+            return 1;
+        }
+    }
+    printf("Tried to create too many jobs\n");
+    return 0;
+}
+
+/* deletejob - Delete a job whose PID=pid from the job list */
+int deletejob(job_t *jobs, pid_t pid) {
+    if (pid < 1)
+        return 0;
+    for (int i = 0; i < MPSH_MAXJOBS; i++) {
+        if (jobs[i].pid == pid) {
+            clearjob(&jobs[i]);
+            nextjid = maxjid(jobs) + 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* getjobpid - Find a job (by PID) on the job list */
+job_t *getjobpid(job_t *jobs, pid_t pid) {
+    if (pid < 1)
+        return NULL;
+    for (int i = 0; i < MPSH_MAXJOBS; i++)
+        if (jobs[i].pid == pid)
+            return &jobs[i];
+    return NULL;
+}
+
+/* getjobjid - Find a job (by JID) on the job list */
+job_t *getjobjid(job_t *jobs, int jid) {
+    if (jid < 1)
+        return NULL;
+    for (int i = 0; i < MPSH_MAXJOBS; i++)
+        if (jobs[i].jid == jid)
+            return &jobs[i];
+    return NULL;
+}
+
+/* pid2jid - Map process ID to job ID */
+int pid2jid(pid_t pid) {
+    if (pid < 1)
+        return 0;
+    for (int i = 0; i < MPSH_MAXJOBS; i++)
+        if (jobs[i].pid == pid)
+            return jobs[i].jid;
+    return 0;
+}
+
+/* listjobs - Print the job list */
+int listjobs(job_t *jobs) {
+    for (int i = 0; i < MPSH_MAXJOBS; i++) {
+        if (jobs[i].pid != 0) {
+            printf("[%d] (%d) ", jobs[i].jid, jobs[i].pid);
+            switch (jobs[i].state) {
+                case BG:
+                    printf("Running ");
+                    break;
+                case FG:
+                    printf("Foreground ");
+                    break;
+                case ST:
+                    printf("Stopped ");
+                    break;
+                default:
+                    printf("listjobs: Internal error: job[%d].state=%d ", i, jobs[i].state);
+            }
+            printf("%s", jobs[i].cmdline);
+        }
+    }
+    return 1;
+}
+
+/******************************
+ * end job list helper routines
+ ******************************/
+
+/***********************
+ * Other helper routines
+ ***********************/
+/*
+ * unix_error - unix-style error routine
+ */
+void unix_error(char *msg) {
+    fprintf(stdout, "%s: %s\n", msg, strerror(errno));
+    exit(1);
+}
+
+/*
+ * Signal - wrapper for the sigaction function
+ */
+handler_t *Signal(int signum, handler_t *handler) {
+    struct sigaction action, old_action;
+
+    action.sa_handler = handler;
+    sigemptyset(&action.sa_mask); /* block sigs of type being handled */
+    action.sa_flags = SA_RESTART; /* restart syscalls if possible */
+
+    if (sigaction(signum, &action, &old_action) < 0)
+        unix_error("Signal error");
+    return (old_action.sa_handler);
 }
