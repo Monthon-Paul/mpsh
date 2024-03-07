@@ -37,12 +37,6 @@ typedef struct IO {
 /* List of builtin commands */
 static char *builtin_str[] = {"help", "quit", "cd", "history", "jobs", "fg", "bg"};
 
-int (*builtin_func[])(char **) = {
-    &mpsh_help,
-    &mpsh_exit,
-    &mpsh_cd,
-    &mpsh_history};
-
 /* forward declarations */
 char ***mpsh_split_line(char *line);
 int mpsh_execute(char ***args, char **cmds);
@@ -60,6 +54,12 @@ char *concatstr(char **str, int bg);
 char *mpsh_read_line();
 int mpsh_size_builtins();
 void mpsh_loop();
+
+int (*builtin_func[])(char **) = {
+    &mpsh_help,
+    &mpsh_exit,
+    &mpsh_cd,
+    &mpsh_history};
 
 void sigchld_handler(int sig);
 // void sigtstp_handler(int sig);
@@ -80,4 +80,4 @@ void unix_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
 
-#endif  // include guard
+#endif // include guard
