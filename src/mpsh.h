@@ -41,14 +41,14 @@ static char *builtin_str[] = {"help", "quit", "cd", "history", "jobs", "fg", "bg
 char ***mpsh_split_line(char *line);
 int mpsh_execute(char ***args, char **cmds);
 int mpsh_launch(char ***args, sigset_t sigs);
-int mpsh_piping(char ***args);
+int mpsh_piping(char ***args, sigset_t sigs);
 int mpsh_history(char **cmds);
 int mpsh_cd(char **args);
 int mpsh_help(char **args);
 int mpsh_exit(char **args);
+int mpsh_bg(int jid);
+int mpsh_fg(int jid);
 void mpsh_redirect(int pos);
-void mpsh_bg(int jid);
-void mpsh_fg(int jid);
 void waitfg(pid_t pid);
 char *concatstr(char **str, int bg);
 char *mpsh_read_line();
@@ -62,9 +62,8 @@ int (*builtin_func[])(char **) = {
     &mpsh_history};
 
 void sigchld_handler(int sig);
-// void sigtstp_handler(int sig);
-// void sigint_handler(int sig);
-// void sigquit_handler(int sig);
+void sigtstp_handler(int sig);
+void sigint_handler(int sig);
 
 void clearjob(job_t *job);
 void initjobs(job_t *jobs);

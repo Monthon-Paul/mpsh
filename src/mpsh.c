@@ -4,7 +4,7 @@
  * I/O redirect, Piping & many more
  *
  * @author Monthon Paul
- * @version March 7, 2024
+ * @version March 11, 2024
  */
 #include "mpsh.h"
 
@@ -28,12 +28,9 @@ int nextjid = 1; /* next job ID to allocate */
 int main(int argc, char **argv) {
     /* Install the signal handlers */
 
-    // Signal(SIGINT, sigint_handler);   /* ctrl-c */
-    // Signal(SIGTSTP, sigtstp_handler); /* ctrl-z */
+    Signal(SIGINT, sigint_handler);   /* ctrl-c */
+    Signal(SIGTSTP, sigtstp_handler); /* ctrl-z */
     Signal(SIGCHLD, sigchld_handler); /* Terminated or stopped child */
-
-    /* This one provides a clean way to kill the shell */
-    // Signal(SIGQUIT, sigquit_handler);
 
     /* Initialize the job list */
     initjobs(jobs);
@@ -174,7 +171,7 @@ int mpsh_execute(char ***args, char **cmds) {
     sigaddset(&sigs, SIGINT);
 
     if (*args[1] && piping)
-        return mpsh_piping(args);
+        return mpsh_piping(args, sigs);
     for (int i = 0; i < mpsh_size_builtins(); i++) {
         if (!strcmp(**args, "jobs"))
             return listjobs(jobs);
@@ -182,9 +179,25 @@ int mpsh_execute(char ***args, char **cmds) {
             return (*builtin_func[i])(cmds);
         else if (!strcmp(**args, builtin_str[i]))
             return (*builtin_func[i])(*args);
+        else if (!strcmp(**args, "bg") || !strcmp(**args, "fg")) {
+            int jid;
+            if ((*args)[1] == NULL) {
+                printf("%s command requires a %%jobid argument\n", **args);
+                return 1;
+            }
+            if (*args[0][1] == '%')
+                jid = atoi(&args[0][1][1]);
+            else {
+                printf("%s: argument must be a %%jobid\n", **args);
+                return 1;
+            }
+            if (!strcmp(**args, "bg"))
+                return mpsh_bg(jid);
+            else
+                return mpsh_fg(jid);
+        }
     }
-
-    return mpsh_launch(args, sigs);  // launch
+    return mpsh_launch(args, sigs); // launch
 }
 
 /**
@@ -239,6 +252,44 @@ int mpsh_cd(char **args) {
 }
 
 /**
+ * @brief exec builtin foreground command
+ * @param jid takes job id number.
+ * @return Always returns 1, to continue execution.
+ */
+int mpsh_bg(int jid) {
+    // get background job from jid
+    job_t *bg_job = getjobjid(jobs, jid);
+    // check if process exist in background in order send SIGCONT signal
+    if (bg_job != NULL) {
+        bg_job->state = BG;
+        kill(-(bg_job->pid), SIGCONT);
+        printf("[%d] (%d) %s", pid2jid(bg_job->pid), bg_job->pid, bg_job->cmdline);
+    } else {
+        printf("%%%d: No such job\n", jid);
+    }
+    return 1;
+}
+
+/**
+ * @brief exec builtin background command
+ * @param jid takes job id number.
+ * @return Always returns 1, to continue execution.
+ */
+int mpsh_fg(int jid) {
+    // get foreground job from jid
+    job_t *fg_job = getjobjid(jobs, jid);
+    // check if process exist in foreground in order send SIGCONT signal
+    if (fg_job != NULL) {
+        fg_job->state = FG;
+        kill(-(fg_job->pid), SIGCONT);
+        waitfg(fg_job->pid);
+    } else {
+        printf("%%%d: No such job\n", jid);
+    }
+    return 1;
+}
+
+/**
  * @brief Launch a program and wait for it to terminate.
  * @param args Null terminated list of arguments (including program).
  * @return Always returns 1, to continue execution.
@@ -250,11 +301,9 @@ int mpsh_launch(char ***args, sigset_t sigs) {
     for (int i = 0; *args[i] != NULL; i++) {
         sigprocmask(SIG_BLOCK, &sigs, NULL);
         if ((pid = fork()) == 0) {
-            // Set process group ID
-            setpgid(0, 0);
-
             // need to unblock before exec call
             sigprocmask(SIG_UNBLOCK, &sigs, NULL);
+
             mpsh_redirect(i);
             if (execvp(*args[i], args[i]) == -1) {
                 printf("%s: Command not found\n", *args[i]);
@@ -274,8 +323,10 @@ int mpsh_launch(char ***args, sigset_t sigs) {
 }
 
 /**
- *
- *
+ * @brief concatnate an array of strings
+ * @param str an array of strings
+ * @param bg check if it's in the background
+ * @return concatnated string with spaces
  */
 char *concatstr(char **str, int bg) {
     *concat = '\0';
@@ -334,9 +385,11 @@ void mpsh_redirect(int pos) {
  * @param args 2D array of strings terminated by NULL
  * @return Always returns 1, to continue execution.
  */
-int mpsh_piping(char ***args) {
+int mpsh_piping(char ***args, sigset_t sigs) {
     pid_t pid;
     int fds[2], size, next_input;
+
+    sigprocmask(SIG_BLOCK, &sigs, NULL);
     for (size = 0; *args[size] != NULL; size++) {
     }
     pipe(fds);
@@ -348,6 +401,9 @@ int mpsh_piping(char ***args) {
         close(fds[0]);
         close(fds[1]);
 
+        // need to unblock before exec call
+        sigprocmask(SIG_UNBLOCK, &sigs, NULL);
+
         // check for I/O redirects
         mpsh_redirect(0);
         if (execvp(**args, *args) == -1) {
@@ -355,6 +411,7 @@ int mpsh_piping(char ***args) {
             exit(1);
         }
     }
+    addjob(jobs, pid, FG, concatstr(*args, 0));
     /* middle pipeline loop */
     for (int i = 1; i < size - 1; i++) {
         close(fds[1]);
@@ -365,6 +422,9 @@ int mpsh_piping(char ***args) {
             dup2(fds[1], STDOUT_FILENO);
             close(fds[0]);
 
+            // need to unblock before exec call
+            sigprocmask(SIG_UNBLOCK, &sigs, NULL);
+
             // check for I/O redirects
             mpsh_redirect(i);
             if (execvp(*args[i], args[i]) == -1) {
@@ -373,12 +433,16 @@ int mpsh_piping(char ***args) {
             }
         }
         close(next_input);
+        addjob(jobs, pid, FG, *args[i]);
     }
     close(fds[1]);
     next_input = fds[0];
     if ((pid = fork()) == 0) {  // special case: redirect only to stdin
         // first child redirects read end to stdin
         dup2(next_input, STDIN_FILENO);
+
+        // need to unblock before exec call
+        sigprocmask(SIG_UNBLOCK, &sigs, NULL);
 
         // check for I/O redirects
         mpsh_redirect(size - 1);
@@ -388,10 +452,13 @@ int mpsh_piping(char ***args) {
         }
     }
     close(next_input);
+
+    // add jobs for both process and Unblock Signal
+    addjob(jobs, pid, FG, concatstr(args[size - 1], 0));
+    sigprocmask(SIG_UNBLOCK, &sigs, NULL);
     // Parent
-    int status;
     for (int i = 0; i < size - 1; i++)
-        waitpid(pid, &status, 0);
+        waitfg(pid);
     return 1;
 }
 
@@ -413,13 +480,47 @@ void sigchld_handler(int sig) {
     // Use WNOHANG or WUNTRACED so we can stop this loop as soon as no zombies are available.
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
         if (WIFSIGNALED(status)) {
-            printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, SIGINT);
+            printf("\nJob [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, SIGINT);
             deletejob(jobs, pid);
         } else if (WIFSTOPPED(status)) {
-            printf("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, SIGTSTP);
+            printf("\nJob [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, SIGTSTP);
             getjobpid(jobs, pid)->state = ST;
         } else if (WIFEXITED(status))
             deletejob(jobs, pid);
+    }
+}
+
+/*
+ * sigint_handler - The kernel sends a SIGINT to the shell whenver the
+ *    user types ctrl-c at the keyboard.  Catch it and send it along
+ *    to the foreground job.
+ */
+void sigint_handler(int sig) {
+    pid_t pid;
+    // loop through jobs then send signal
+    for (int i = 0; i < MPSH_MAXJOBS; i++) {
+        if (jobs[i].state == FG) {
+            pid = jobs[i].pid;
+            kill(-pid, SIGINT);
+            break;
+        }
+    }
+}
+
+/*
+ * sigtstp_handler - The kernel sends a SIGTSTP to the shell whenever
+ *     the user types ctrl-z at the keyboard. Catch it and suspend the
+ *     foreground job by sending a SIGTSTP.
+ */
+void sigtstp_handler(int sig) {
+    pid_t pid;
+    // loop through jobs then send signal
+    for (int i = 0; i < MPSH_MAXJOBS; i++) {
+        if (jobs[i].state == FG) {
+            pid = jobs[i].pid;
+            kill(-pid, SIGTSTP);
+            break;
+        }
     }
 }
 
