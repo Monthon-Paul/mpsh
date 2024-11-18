@@ -10,7 +10,7 @@ It demonstrates the basics of how a shell works.
 Many features can exec program, piping, redirection, listing, run backgrounds, 
 list of jobs, Ctrl-C, Ctrl-Z, foreground, and background.
 
-* builtins commands: `help`, `quit`, `cd`, `hisotry`, `jobs`, `fg`, `bg`.
+* builtins commands: `help`, `quit`, `cd`, `history`, `jobs`, `fg`, `bg`.
 
 ## Running
 
